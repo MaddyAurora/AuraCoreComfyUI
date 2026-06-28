@@ -1,0 +1,29 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Generated outputs (images)
+outputs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Gradio temp / cache
+gradio_cached_examples/
+*.gradio/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor folders
+.vscode/
+.idea/
+
+# Logs
+*.log
