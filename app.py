@@ -24,7 +24,7 @@ import urllib.parse
 import uuid
 import websocket
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 import gradio as gr
 
@@ -105,7 +105,38 @@ def queue_prompt(workflow: dict) -> str | None:
     return None
 
 
-def wait_for_result(prompt_id: str, timeout: int = 300) -> list[Path]:
+def _build_progress_bar(pct: int) -> str:
+    """Return an HTML progress bar string for the status strip."""
+    filled = round(pct / 5)   # 20 blocks total (0–100 → 0–20)
+    empty  = 20 - filled
+    bar    = "█" * filled + "░" * empty
+    return (
+        f'<p class="aura-status">'  
+        f'<span class="aura-bar">{bar}</span>'  
+        f'&nbsp; Generating… {pct}%'  
+        f'</p>'
+    )
+
+
+def stream_generation(
+    prompt_id: str,
+    timeout: int = 300,
+) -> Generator[str | None, None, list[Path]]:
+    """
+    Generator that:
+      - yields HTML status strings as ComfyUI sends progress frames
+      - returns the list of saved image Paths when done
+
+    Usage (inside an outer generator):
+        gen = stream_generation(pid)
+        images = None
+        try:
+            while True:
+                status_html = next(gen)
+                yield status_html          # push to Gradio
+        except StopIteration as e:
+            images = e.value
+    """
     ws = websocket.WebSocket()
     try:
         ws.connect(f"{WS_URL}?clientId={CLIENT_ID}")
@@ -118,16 +149,35 @@ def wait_for_result(prompt_id: str, timeout: int = 300) -> list[Path]:
         while time.time() - start < timeout:
             try:
                 raw = ws.recv()
-                msg = json.loads(raw) if isinstance(raw, str) else {}
             except Exception:
                 break
+
+            if isinstance(raw, bytes):
+                # Binary preview frames — ignore
+                continue
+
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+
             mtype = msg.get("type", "")
             data  = msg.get("data", {})
-            if mtype == "executing" and data.get("node") is None and data.get("prompt_id") == prompt_id:
-                break
+
+            if mtype == "progress":
+                value = data.get("value", 0)
+                max_v = data.get("max", 1) or 1
+                pct   = round(value / max_v * 100)
+                yield _build_progress_bar(pct)
+
+            elif mtype == "executing":
+                if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                    # Generation complete
+                    break
     finally:
         ws.close()
 
+    # Fetch output images
     history = comfy_api(f"history/{prompt_id}")
     if not history or prompt_id not in history:
         return []
@@ -344,7 +394,6 @@ def build_model_tab(label: str, subfolder: str):
 
             # ── Right: status HTML strip, then gallery ─────────────
             with gr.Column(scale=3):
-                # gr.HTML renders in DOM order — Gradio never reorders it
                 status_html = gr.HTML(
                     value='<p class="aura-status">Ready.</p>',
                 )
@@ -387,7 +436,6 @@ def build_model_tab(label: str, subfolder: str):
         rand_seed_btn.click(fn=lambda: random.randint(0, 2**31), outputs=seed)
 
         def _status(msg: str) -> str:
-            """Wrap a message in the status HTML pill."""
             return f'<p class="aura-status">{msg}</p>'
 
         def run_generation(wf_choice, pos, neg, st, cf, w, h, sd, ar, mp):
@@ -426,12 +474,22 @@ def build_model_tab(label: str, subfolder: str):
                 yield gr.Gallery(value=[], selected_index=None), _status("❌ Failed to queue — check ComfyUI logs.")
                 return
 
-            yield gr.Gallery(value=[], selected_index=None), _status(f"⏳ Generating… [{wf_choice}] &nbsp; id={pid[:8]}")
+            # Show initial 0% bar immediately
+            yield gr.Gallery(value=[], selected_index=None), _build_progress_bar(0)
 
-            images = wait_for_result(pid)
+            # Stream progress updates from ComfyUI WebSocket
+            gen = stream_generation(pid)
+            images = []
+            try:
+                while True:
+                    html = next(gen)
+                    yield gr.Gallery(value=[], selected_index=None), html
+            except StopIteration as e:
+                images = e.value  # list[Path] returned by the generator
+
             if images:
                 paths = [str(p) for p in images]
-                yield gr.Gallery(value=paths, selected_index=0), _status(f"✅ Done — {len(images)} image(s) &nbsp;·&nbsp; seed {final_seed}")
+                yield gr.Gallery(value=paths, selected_index=0), _status(f"✅ Done — {len(images)} image(s)")
             else:
                 yield gr.Gallery(value=[], selected_index=None), _status("⚠️ Done but no images returned.")
 
@@ -504,7 +562,7 @@ footer { display: none !important; }
 
 .gradio-container > .main > .wrap { padding-top: 0 !important; }
 
-/* Status strip that sits directly above the gallery */
+/* Status strip directly above the gallery */
 .aura-status {
     margin: 0 0 4px 0 !important;
     padding: 3px 10px !important;
@@ -515,9 +573,16 @@ footer { display: none !important; }
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    font-family: monospace;
 }
 
-/* Make the gallery preview image fill the container */
+/* Block characters in the progress bar render crisply */
+.aura-bar {
+    letter-spacing: 1px;
+    color: var(--color-accent, #4f98a3);
+}
+
+/* Gallery */
 .gradio-gallery .preview-container,
 .gradio-gallery .preview-container img {
     width: 100% !important;
