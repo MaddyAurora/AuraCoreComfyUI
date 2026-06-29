@@ -41,7 +41,6 @@ log = logging.getLogger("AuraCoreComfyUI")
 # ───────────────────────────────────────────────
 # Model tab definitions
 # Each entry: (Tab label, subfolder name inside workflows/)
-# Subfolder name is used to discover .json files for the dropdown.
 # ───────────────────────────────────────────────
 MODEL_TABS = [
     ("Krea 2",       "krea2"),
@@ -139,14 +138,12 @@ def wait_for_result(prompt_id: str, timeout: int = 300) -> list[Path]:
 # ───────────────────────────────────────────────
 
 def get_workflows_for_model(subfolder: str) -> list[Path]:
-    """Return all .json files inside workflows/<subfolder>/."""
     folder = WORKFLOWS_DIR / subfolder
     folder.mkdir(parents=True, exist_ok=True)
     return sorted(folder.glob("*.json"))
 
 
 def workflow_choices(subfolder: str) -> list[str]:
-    """Return display names (stems) for the workflow dropdown."""
     files = get_workflows_for_model(subfolder)
     if not files:
         return ["(no workflows yet)"]
@@ -154,7 +151,6 @@ def workflow_choices(subfolder: str) -> list[str]:
 
 
 def workflow_path_from_choice(subfolder: str, choice: str) -> Path | None:
-    """Resolve a display name back to its Path."""
     files = get_workflows_for_model(subfolder)
     for f in files:
         if f.stem.replace("_", " ").replace("-", " ").title() == choice:
@@ -207,24 +203,24 @@ def inject_text2img_params(
 # ───────────────────────────────────────────────
 
 def build_model_tab(label: str, subfolder: str):
-    """
-    Build a tab for one AI model.
-    Workflows are selected from a dropdown populated by
-    .json files found in workflows/<subfolder>/.
-    """
     choices = workflow_choices(subfolder)
 
     with gr.TabItem(label):
-        with gr.Row():
+        # Top bar: dropdown (no label) + Refresh + Generate stacked on the right
+        with gr.Row(equal_height=True):
             workflow_dd = gr.Dropdown(
                 choices=choices,
                 value=choices[0],
-                label="Workflow",
-                scale=3,
+                label="",          # no label — removes the "Workflow" heading
+                show_label=False,
+                scale=4,
                 interactive=True,
             )
-            reload_btn = gr.Button("🔄 Refresh", scale=1, size="sm")
+            with gr.Column(scale=1, min_width=110):
+                reload_btn   = gr.Button("🔄 Refresh",  size="sm")
+                generate_btn = gr.Button("🎨 Generate", variant="primary", size="sm")
 
+        # Main content row
         with gr.Row():
             with gr.Column(scale=2):
                 pos_prompt = gr.Textbox(
@@ -238,7 +234,7 @@ def build_model_tab(label: str, subfolder: str):
                     lines=2,
                 )
                 with gr.Row():
-                    steps = gr.Slider(1, 60,   value=20,  step=1,   label="Steps")
+                    steps = gr.Slider(1, 60,    value=20,  step=1,   label="Steps")
                     cfg   = gr.Slider(1.0, 20.0, value=7.0, step=0.5, label="CFG")
                 with gr.Row():
                     width  = gr.Slider(256, 2048, value=1024, step=64, label="Width")
@@ -246,8 +242,7 @@ def build_model_tab(label: str, subfolder: str):
                 with gr.Row():
                     seed          = gr.Number(value=-1, label="Seed  (−1 = random)", precision=0)
                     rand_seed_btn = gr.Button("🎲 Randomize", size="sm")
-                generate_btn = gr.Button("🎨 Generate", variant="primary", size="lg")
-                status_box   = gr.Textbox(label="Status", interactive=False, lines=1)
+                status_box = gr.Textbox(label="Status", interactive=False, lines=1)
 
             with gr.Column(scale=3):
                 output_gallery = gr.Gallery(
@@ -354,7 +349,6 @@ def build_settings_tab():
 APP_CSS = """
 footer { display: none !important; }
 
-/* Tighten the header so tabs appear higher */
 #aura-header {
     display: flex;
     align-items: center;
@@ -374,7 +368,6 @@ footer { display: none !important; }
     white-space: nowrap;
 }
 
-/* Remove default top margin from Blocks so tabs sit right below header */
 .gradio-container > .main > .wrap {
     padding-top: 0 !important;
 }
@@ -389,7 +382,6 @@ def create_app() -> gr.Blocks:
     ok, status_msg = check_connection()
 
     with gr.Blocks(title="AuraCoreComfyUI") as demo:
-        # Compact header: title on left, connection status on right
         gr.HTML(f"""
             <div id="aura-header">
                 <span id="aura-title">🎨 AuraCoreComfyUI</span>
