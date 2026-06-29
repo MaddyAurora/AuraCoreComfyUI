@@ -5,6 +5,12 @@ Each tab = one AI model.
 Inside each tab, a dropdown selects which workflow JSON to run.
 Workflows live in: ./workflows/<model_folder>/<workflow>.json
 
+Sidecar config system:
+  Each workflow can have an optional <workflow_stem>_config.json next to it.
+  This JSON tells the injector exactly which node IDs / fields to patch,
+  handling exotic workflows (custom prompt nodes, no negative prompt,
+  aspect-ratio resolution selectors, etc.) without touching app.py.
+
 ComfyUI must be running separately (default: http://127.0.0.1:8188)
 """
 
@@ -40,13 +46,24 @@ log = logging.getLogger("AuraCoreComfyUI")
 
 # ───────────────────────────────────────────────
 # Model tab definitions
-# Each entry: (Tab label, subfolder name inside workflows/)
 # ───────────────────────────────────────────────
 MODEL_TABS = [
     ("Krea 2",       "krea2"),
     ("Qwen Image",   "qwen_image"),
     ("Ideogram 4",   "ideogram4"),
     ("Klein 9B",     "klein9b"),
+]
+
+# Aspect ratio options exposed in the UI for resolution-selector workflows
+ASPECT_RATIO_OPTIONS = [
+    "1:1 (Square)",
+    "16:9 (Widescreen)",
+    "9:16 (Portrait)",
+    "4:3 (Standard)",
+    "3:4 (Portrait Standard)",
+    "3:2 (Photo)",
+    "2:3 (Portrait Photo)",
+    "21:9 (Ultrawide)",
 ]
 
 
@@ -57,7 +74,6 @@ CLIENT_ID = str(uuid.uuid4())
 
 
 def comfy_api(endpoint: str, data: dict | None = None) -> Any:
-    """GET (data=None) or POST to ComfyUI REST API."""
     url = f"{COMFYUI_URL}/{endpoint}"
     if data is None:
         req = urllib.request.Request(url)
@@ -138,9 +154,10 @@ def wait_for_result(prompt_id: str, timeout: int = 300) -> list[Path]:
 # ───────────────────────────────────────────────
 
 def get_workflows_for_model(subfolder: str) -> list[Path]:
+    """Return all workflow .json files (excludes *_config.json sidecars)."""
     folder = WORKFLOWS_DIR / subfolder
     folder.mkdir(parents=True, exist_ok=True)
-    return sorted(folder.glob("*.json"))
+    return sorted(f for f in folder.glob("*.json") if not f.stem.endswith("_config"))
 
 
 def workflow_choices(subfolder: str) -> list[str]:
@@ -163,8 +180,46 @@ def load_workflow(path: Path) -> dict:
         return json.load(f)
 
 
-def inject_text2img_params(
+def load_sidecar_config(workflow_path: Path) -> dict | None:
+    """
+    Look for <workflow_stem>_config.json next to the workflow file.
+    Returns the parsed dict, or None if no sidecar exists.
+    """
+    config_path = workflow_path.parent / (workflow_path.stem + "_config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            log.info(f"Loaded sidecar config: {config_path.name}")
+            return cfg
+        except Exception as e:
+            log.warning(f"Could not load sidecar config {config_path.name}: {e}")
+    return None
+
+
+def has_aspect_ratio_config(workflow_path: Path) -> bool:
+    """Return True if this workflow uses a ResolutionSelector (aspect ratio mode)."""
+    cfg = load_sidecar_config(workflow_path)
+    if cfg and "resolution_node" in cfg:
+        return cfg["resolution_node"].get("mode") == "aspect_ratio"
+    return False
+
+
+def has_negative_prompt(workflow_path: Path) -> bool:
+    """Return False if the sidecar explicitly disables the negative prompt."""
+    cfg = load_sidecar_config(workflow_path)
+    if cfg is not None:
+        return cfg.get("negative_prompt", True) is not False
+    return True  # default: show negative prompt
+
+
+# ───────────────────────────────────────────────
+# Injection engine
+# ───────────────────────────────────────────────
+
+def inject_params(
     workflow: dict,
+    workflow_path: Path,
     positive: str,
     negative: str,
     steps: int,
@@ -172,28 +227,75 @@ def inject_text2img_params(
     width: int,
     height: int,
     seed: int,
+    aspect_ratio: str = "1:1 (Square)",
+    megapixels: float = 1.0,
 ) -> dict:
-    wf = json.loads(json.dumps(workflow))
+    """
+    Inject UI values into a workflow using the sidecar config when present,
+    falling back to the generic class_type heuristic for unconfigured workflows.
+    """
+    wf  = json.loads(json.dumps(workflow))  # deep copy
+    cfg_data = load_sidecar_config(workflow_path)
 
-    for node_id, node in wf.items():
-        ctype = node.get("class_type", "")
-        if ctype in ("KSampler", "KSamplerAdvanced"):
-            inp = node.get("inputs", {})
-            inp["steps"]   = steps
-            inp["cfg"]     = cfg
-            inp["seed"]    = seed if seed != -1 else random.randint(0, 2**31)
-            inp["denoise"] = inp.get("denoise", 1.0)
-        if ctype in ("EmptyLatentImage", "EmptySD3LatentImage"):
-            inp = node.get("inputs", {})
-            inp["width"]  = width
-            inp["height"] = height
+    if cfg_data:
+        # ─── SIDECAR PATH ───
+        # Prompt
+        pn = cfg_data.get("prompt_node")
+        if pn:
+            wf[pn["id"]]["inputs"][pn["field"]] = positive
 
-    clip_nodes = [(nid, n) for nid, n in wf.items()
-                  if n.get("class_type") == "CLIPTextEncode"]
-    if len(clip_nodes) >= 1:
-        clip_nodes[0][1]["inputs"]["text"] = positive
-    if len(clip_nodes) >= 2:
-        clip_nodes[1][1]["inputs"]["text"] = negative
+        # Negative prompt (only if enabled)
+        neg_cfg = cfg_data.get("negative_prompt", True)
+        if neg_cfg and isinstance(neg_cfg, dict):
+            wf[neg_cfg["id"]]["inputs"][neg_cfg["field"]] = negative
+
+        # Seed
+        sn = cfg_data.get("seed_node")
+        if sn:
+            wf[sn["id"]]["inputs"][sn["field"]] = seed if seed != -1 else random.randint(0, 2**31)
+
+        # Steps
+        st = cfg_data.get("steps_node")
+        if st:
+            wf[st["id"]]["inputs"][st["field"]] = steps
+
+        # CFG
+        cf = cfg_data.get("cfg_node")
+        if cf:
+            wf[cf["id"]]["inputs"][cf["field"]] = cfg
+
+        # Resolution — aspect ratio mode
+        rn = cfg_data.get("resolution_node")
+        if rn and rn.get("mode") == "aspect_ratio":
+            wf[rn["id"]]["inputs"][rn["aspect_ratio_field"]] = aspect_ratio
+            wf[rn["id"]]["inputs"][rn["megapixels_field"]]   = megapixels
+
+        # Resolution — pixel mode
+        elif rn and rn.get("mode", "pixels") == "pixels":
+            wf[rn["id"]]["inputs"][rn.get("width_field",  "width")]  = width
+            wf[rn["id"]]["inputs"][rn.get("height_field", "height")] = height
+
+    else:
+        # ─── FALLBACK HEURISTIC PATH (no sidecar) ───
+        for node_id, node in wf.items():
+            ctype = node.get("class_type", "")
+            if ctype in ("KSampler", "KSamplerAdvanced"):
+                inp = node["inputs"]
+                inp["steps"]   = steps
+                inp["cfg"]     = cfg
+                inp["seed"]    = seed if seed != -1 else random.randint(0, 2**31)
+                inp["denoise"] = inp.get("denoise", 1.0)
+            if ctype in ("EmptyLatentImage", "EmptySD3LatentImage"):
+                inp = node["inputs"]
+                inp["width"]  = width
+                inp["height"] = height
+
+        clip_nodes = [(nid, n) for nid, n in wf.items()
+                      if n.get("class_type") == "CLIPTextEncode"]
+        if len(clip_nodes) >= 1:
+            clip_nodes[0][1]["inputs"]["text"] = positive
+        if len(clip_nodes) >= 2:
+            clip_nodes[1][1]["inputs"]["text"] = negative
 
     return wf
 
@@ -205,13 +307,18 @@ def inject_text2img_params(
 def build_model_tab(label: str, subfolder: str):
     choices = workflow_choices(subfolder)
 
+    # Determine initial UI state from the first available workflow
+    first_path = workflow_path_from_choice(subfolder, choices[0]) if choices[0] != "(no workflows yet)" else None
+    init_ar_mode  = has_aspect_ratio_config(first_path) if first_path else False
+    init_show_neg = has_negative_prompt(first_path)     if first_path else True
+
     with gr.TabItem(label):
-        # Top bar: dropdown (no label) + Refresh + Generate stacked on the right
+        # Top bar: workflow dropdown + Refresh / Generate
         with gr.Row(equal_height=True):
             workflow_dd = gr.Dropdown(
                 choices=choices,
                 value=choices[0],
-                label="",          # no label — removes the "Workflow" heading
+                label="",
                 show_label=False,
                 scale=4,
                 interactive=True,
@@ -220,7 +327,7 @@ def build_model_tab(label: str, subfolder: str):
                 reload_btn   = gr.Button("🔄 Refresh",  size="sm")
                 generate_btn = gr.Button("🎨 Generate", variant="primary", size="sm")
 
-        # Main content row
+        # Main two-column layout
         with gr.Row():
             with gr.Column(scale=2):
                 pos_prompt = gr.Textbox(
@@ -232,13 +339,32 @@ def build_model_tab(label: str, subfolder: str):
                     label="Negative Prompt",
                     placeholder="blurry, low quality, watermark...",
                     lines=2,
+                    visible=init_show_neg,
                 )
-                with gr.Row():
-                    steps = gr.Slider(1, 60,    value=20,  step=1,   label="Steps")
-                    cfg   = gr.Slider(1.0, 20.0, value=7.0, step=0.5, label="CFG")
-                with gr.Row():
+
+                # Pixel resolution controls (hidden when aspect-ratio mode)
+                with gr.Row(visible=not init_ar_mode) as pixel_row:
                     width  = gr.Slider(256, 2048, value=1024, step=64, label="Width")
                     height = gr.Slider(256, 2048, value=1024, step=64, label="Height")
+
+                # Aspect-ratio / megapixels controls (shown when aspect-ratio mode)
+                with gr.Row(visible=init_ar_mode) as ar_row:
+                    aspect_ratio_dd = gr.Dropdown(
+                        choices=ASPECT_RATIO_OPTIONS,
+                        value="1:1 (Square)",
+                        label="Aspect Ratio",
+                        show_label=True,
+                        scale=3,
+                    )
+                    megapixels_sl = gr.Slider(
+                        0.25, 4.0, value=1.0, step=0.25,
+                        label="Megapixels",
+                        scale=2,
+                    )
+
+                with gr.Row():
+                    steps = gr.Slider(1, 60,    value=8,   step=1,   label="Steps")
+                    cfg   = gr.Slider(1.0, 20.0, value=1.0, step=0.5, label="CFG")
                 with gr.Row():
                     seed          = gr.Number(value=-1, label="Seed  (−1 = random)", precision=0)
                     rand_seed_btn = gr.Button("🎲 Randomize", size="sm")
@@ -252,18 +378,35 @@ def build_model_tab(label: str, subfolder: str):
                     height=620,
                 )
 
-        # Reload workflow list without restarting
+        # — When the user switches workflow, update UI visibility —
+        def on_workflow_change(wf_choice):
+            wf_path   = workflow_path_from_choice(subfolder, wf_choice)
+            ar_mode   = has_aspect_ratio_config(wf_path) if wf_path else False
+            show_neg  = has_negative_prompt(wf_path)     if wf_path else True
+            return (
+                gr.Row(visible=not ar_mode),   # pixel_row
+                gr.Row(visible=ar_mode),        # ar_row
+                gr.Textbox(visible=show_neg),   # neg_prompt
+            )
+
+        workflow_dd.change(
+            fn=on_workflow_change,
+            inputs=workflow_dd,
+            outputs=[pixel_row, ar_row, neg_prompt],
+        )
+
+        # — Refresh workflow list —
         def reload_workflows():
             new_choices = workflow_choices(subfolder)
             return gr.Dropdown(choices=new_choices, value=new_choices[0])
 
         reload_btn.click(fn=reload_workflows, outputs=workflow_dd)
 
-        # Randomize seed
+        # — Randomize seed —
         rand_seed_btn.click(fn=lambda: random.randint(0, 2**31), outputs=seed)
 
-        # Generate
-        def run_generation(wf_choice, pos, neg, st, cf, w, h, sd):
+        # — Generate —
+        def run_generation(wf_choice, pos, neg, st, cf, w, h, sd, ar, mp):
             ok, msg = check_connection()
             if not ok:
                 yield [], msg
@@ -285,9 +428,17 @@ def build_model_tab(label: str, subfolder: str):
                 return
 
             final_seed = int(sd) if int(sd) != -1 else random.randint(0, 2**31)
-            wf  = inject_text2img_params(workflow, pos, neg, int(st), float(cf), int(w), int(h), final_seed)
-            pid = queue_prompt(wf)
 
+            wf = inject_params(
+                workflow, wf_path,
+                positive=pos, negative=neg,
+                steps=int(st), cfg=float(cf),
+                width=int(w), height=int(h),
+                seed=final_seed,
+                aspect_ratio=ar, megapixels=float(mp),
+            )
+
+            pid = queue_prompt(wf)
             if not pid:
                 yield [], "❌ Failed to queue prompt — check ComfyUI logs."
                 return
@@ -296,13 +447,17 @@ def build_model_tab(label: str, subfolder: str):
 
             images = wait_for_result(pid)
             if images:
-                yield [str(p) for p in images], f"✅ Done!  {len(images)} image(s) — {wf_choice}"
+                yield [str(p) for p in images], f"✅ Done!  {len(images)} image(s) — seed {final_seed}"
             else:
                 yield [], "⚠️ Generation finished but no images were returned."
 
         generate_btn.click(
             fn=run_generation,
-            inputs=[workflow_dd, pos_prompt, neg_prompt, steps, cfg, width, height, seed],
+            inputs=[
+                workflow_dd, pos_prompt, neg_prompt,
+                steps, cfg, width, height, seed,
+                aspect_ratio_dd, megapixels_sl,
+            ],
             outputs=[output_gallery, status_box],
         )
 
@@ -339,7 +494,10 @@ def build_settings_tab():
             "**How to add a workflow:**\n"
             "1. In ComfyUI: gear icon → enable Dev Mode → **Save (API Format)**\n"
             "2. Drop the `.json` into the matching model folder above\n"
-            "3. Click 🔄 Refresh on the tab (no restart needed)"
+            "3. If needed, create a `<workflow_name>_config.json` sidecar next to it\n"
+            "4. Click 🔄 Refresh on the tab (no restart needed)\n\n"
+            "**Sidecar config keys:** `prompt_node`, `negative_prompt` (false to hide), "
+            "`seed_node`, `steps_node`, `cfg_node`, `resolution_node`"
         )
 
 
@@ -357,20 +515,10 @@ footer { display: none !important; }
     border-bottom: 1px solid var(--border-color-primary);
     margin-bottom: 0 !important;
 }
-#aura-title {
-    font-size: 1.3rem;
-    font-weight: 700;
-    margin: 0;
-}
-#aura-status {
-    font-size: 0.85rem;
-    opacity: 0.85;
-    white-space: nowrap;
-}
+#aura-title  { font-size: 1.3rem; font-weight: 700; margin: 0; }
+#aura-status { font-size: 0.85rem; opacity: 0.85; white-space: nowrap; }
 
-.gradio-container > .main > .wrap {
-    padding-top: 0 !important;
-}
+.gradio-container > .main > .wrap { padding-top: 0 !important; }
 """
 
 
@@ -388,7 +536,6 @@ def create_app() -> gr.Blocks:
                 <span id="aura-status">{status_msg}</span>
             </div>
         """)
-
         with gr.Tabs():
             for label, subfolder in MODEL_TABS:
                 build_model_tab(label, subfolder)
