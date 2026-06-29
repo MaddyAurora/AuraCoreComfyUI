@@ -303,6 +303,7 @@ def build_model_tab(label: str, subfolder: str):
                 generate_btn = gr.Button("🎨 Generate", variant="primary", size="sm")
 
         with gr.Row():
+            # ── Left column: controls ──────────────────────────────────
             with gr.Column(scale=2):
                 pos_prompt = gr.Textbox(
                     label="Positive Prompt",
@@ -336,9 +337,18 @@ def build_model_tab(label: str, subfolder: str):
                 with gr.Row():
                     seed          = gr.Number(value=-1, label="Seed  (−1 = random)", precision=0)
                     rand_seed_btn = gr.Button("🎲 Randomize", size="sm")
-                status_box = gr.Textbox(label="Status", interactive=False, lines=1)
 
+            # ── Right column: status bar + gallery ─────────────────────
             with gr.Column(scale=3):
+                status_box = gr.Textbox(
+                    value="",
+                    show_label=False,
+                    interactive=False,
+                    lines=1,
+                    max_lines=1,
+                    container=False,
+                    placeholder="Ready.",
+                )
                 output_gallery = gr.Gallery(
                     label="Output",
                     columns=1,
@@ -408,12 +418,12 @@ def build_model_tab(label: str, subfolder: str):
                 yield gr.Gallery(value=[], selected_index=None), "❌ Failed to queue — check ComfyUI logs."
                 return
 
-            yield gr.Gallery(value=[], selected_index=None), f"⏳ Queued [{wf_choice}]  id={pid[:8]}…"
+            yield gr.Gallery(value=[], selected_index=None), f"⏳ Generating…  [{wf_choice}]  id={pid[:8]}"
 
             images = wait_for_result(pid)
             if images:
                 paths = [str(p) for p in images]
-                yield gr.Gallery(value=paths, selected_index=0), f"✅ Done!  {len(images)} image(s) — seed {final_seed}"
+                yield gr.Gallery(value=paths, selected_index=0), f"✅ Done  —  {len(images)} image(s)  ·  seed {final_seed}"
             else:
                 yield gr.Gallery(value=[], selected_index=None), "⚠️ Done but no images returned."
 
@@ -486,6 +496,18 @@ footer { display: none !important; }
 
 .gradio-container > .main > .wrap { padding-top: 0 !important; }
 
+/* Compact labelless status bar above the gallery */
+.status-bar textarea {
+    font-size: 0.82rem !important;
+    padding: 4px 8px !important;
+    min-height: unset !important;
+    height: 28px !important;
+    resize: none !important;
+    border-radius: 4px !important;
+    opacity: 0.85;
+}
+.status-bar { margin-bottom: 4px !important; }
+
 /* Make the gallery preview image fill the container properly */
 .gradio-gallery .preview-container,
 .gradio-gallery .preview-container img {
@@ -503,7 +525,7 @@ footer { display: none !important; }
 def create_app() -> gr.Blocks:
     ok, status_msg = check_connection()
 
-    with gr.Blocks(title="AuraCoreComfyUI") as demo:
+    with gr.Blocks(title="AuraCoreComfyUI", css=APP_CSS) as demo:
         gr.HTML(f"""
             <div id="aura-header">
                 <span id="aura-title">🎨 AuraCoreComfyUI</span>
@@ -526,5 +548,4 @@ if __name__ == "__main__":
         share=False,
         inbrowser=True,
         theme=gr.themes.Soft(),
-        css=APP_CSS,
     )
