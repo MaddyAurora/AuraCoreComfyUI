@@ -289,6 +289,8 @@ def build_model_tab(label: str, subfolder: str):
     init_show_neg = has_negative_prompt(first_path)     if first_path else True
 
     with gr.TabItem(label):
+
+        # Row 1: workflow selector + buttons
         with gr.Row(equal_height=True):
             workflow_dd = gr.Dropdown(
                 choices=choices,
@@ -302,8 +304,10 @@ def build_model_tab(label: str, subfolder: str):
                 reload_btn   = gr.Button("🔄 Refresh",  size="sm")
                 generate_btn = gr.Button("🎨 Generate", variant="primary", size="sm")
 
+        # Row 2: left controls | right (status + gallery)
         with gr.Row():
-            # ── Left column: controls ──────────────────────────────────
+
+            # ── Left: prompt + params ──────────────────────────
             with gr.Column(scale=2):
                 pos_prompt = gr.Textbox(
                     label="Positive Prompt",
@@ -338,16 +342,11 @@ def build_model_tab(label: str, subfolder: str):
                     seed          = gr.Number(value=-1, label="Seed  (−1 = random)", precision=0)
                     rand_seed_btn = gr.Button("🎲 Randomize", size="sm")
 
-            # ── Right column: status bar + gallery ─────────────────────
+            # ── Right: status HTML strip, then gallery ─────────────
             with gr.Column(scale=3):
-                status_box = gr.Textbox(
-                    value="",
-                    show_label=False,
-                    interactive=False,
-                    lines=1,
-                    max_lines=1,
-                    container=False,
-                    placeholder="Ready.",
+                # gr.HTML renders in DOM order — Gradio never reorders it
+                status_html = gr.HTML(
+                    value='<p class="aura-status">Ready.</p>',
                 )
                 output_gallery = gr.Gallery(
                     label="Output",
@@ -358,6 +357,8 @@ def build_model_tab(label: str, subfolder: str):
                     height=620,
                     object_fit="contain",
                 )
+
+        # ── Event handlers ─────────────────────────────────
 
         def on_workflow_change(wf_choice):
             wf_path  = workflow_path_from_choice(subfolder, wf_choice)
@@ -376,31 +377,38 @@ def build_model_tab(label: str, subfolder: str):
         )
 
         reload_btn.click(
-            fn=lambda: gr.Dropdown(choices=workflow_choices(subfolder), value=workflow_choices(subfolder)[0]),
+            fn=lambda: gr.Dropdown(
+                choices=workflow_choices(subfolder),
+                value=workflow_choices(subfolder)[0],
+            ),
             outputs=workflow_dd,
         )
 
         rand_seed_btn.click(fn=lambda: random.randint(0, 2**31), outputs=seed)
 
+        def _status(msg: str) -> str:
+            """Wrap a message in the status HTML pill."""
+            return f'<p class="aura-status">{msg}</p>'
+
         def run_generation(wf_choice, pos, neg, st, cf, w, h, sd, ar, mp):
             ok, msg = check_connection()
             if not ok:
-                yield gr.Gallery(value=[], selected_index=None), msg
+                yield gr.Gallery(value=[], selected_index=None), _status(msg)
                 return
 
             if wf_choice == "(no workflows yet)":
-                yield gr.Gallery(value=[], selected_index=None), f"❌ No workflow. Add a JSON to workflows/{subfolder}/"
+                yield gr.Gallery(value=[], selected_index=None), _status(f"❌ No workflow — add a JSON to workflows/{subfolder}/")
                 return
 
             wf_path = workflow_path_from_choice(subfolder, wf_choice)
             if wf_path is None:
-                yield gr.Gallery(value=[], selected_index=None), f"❌ Cannot find workflow: {wf_choice}"
+                yield gr.Gallery(value=[], selected_index=None), _status(f"❌ Cannot find workflow: {wf_choice}")
                 return
 
             try:
                 workflow = load_workflow(wf_path)
             except Exception as e:
-                yield gr.Gallery(value=[], selected_index=None), f"❌ Cannot load workflow: {e}"
+                yield gr.Gallery(value=[], selected_index=None), _status(f"❌ Cannot load workflow: {e}")
                 return
 
             final_seed = int(sd) if int(sd) != -1 else random.randint(0, 2**31)
@@ -415,17 +423,17 @@ def build_model_tab(label: str, subfolder: str):
 
             pid = queue_prompt(wf)
             if not pid:
-                yield gr.Gallery(value=[], selected_index=None), "❌ Failed to queue — check ComfyUI logs."
+                yield gr.Gallery(value=[], selected_index=None), _status("❌ Failed to queue — check ComfyUI logs.")
                 return
 
-            yield gr.Gallery(value=[], selected_index=None), f"⏳ Generating…  [{wf_choice}]  id={pid[:8]}"
+            yield gr.Gallery(value=[], selected_index=None), _status(f"⏳ Generating… [{wf_choice}] &nbsp; id={pid[:8]}")
 
             images = wait_for_result(pid)
             if images:
                 paths = [str(p) for p in images]
-                yield gr.Gallery(value=paths, selected_index=0), f"✅ Done  —  {len(images)} image(s)  ·  seed {final_seed}"
+                yield gr.Gallery(value=paths, selected_index=0), _status(f"✅ Done — {len(images)} image(s) &nbsp;·&nbsp; seed {final_seed}")
             else:
-                yield gr.Gallery(value=[], selected_index=None), "⚠️ Done but no images returned."
+                yield gr.Gallery(value=[], selected_index=None), _status("⚠️ Done but no images returned.")
 
         generate_btn.click(
             fn=run_generation,
@@ -434,7 +442,7 @@ def build_model_tab(label: str, subfolder: str):
                 steps, cfg, width, height, seed,
                 aspect_ratio_dd, megapixels_sl,
             ],
-            outputs=[output_gallery, status_box],
+            outputs=[output_gallery, status_html],
         )
 
 
@@ -496,19 +504,20 @@ footer { display: none !important; }
 
 .gradio-container > .main > .wrap { padding-top: 0 !important; }
 
-/* Compact labelless status bar above the gallery */
-.status-bar textarea {
+/* Status strip that sits directly above the gallery */
+.aura-status {
+    margin: 0 0 4px 0 !important;
+    padding: 3px 10px !important;
     font-size: 0.82rem !important;
-    padding: 4px 8px !important;
-    min-height: unset !important;
-    height: 28px !important;
-    resize: none !important;
-    border-radius: 4px !important;
-    opacity: 0.85;
+    opacity: 0.88;
+    border-radius: 4px;
+    background: var(--background-fill-secondary, rgba(0,0,0,0.04));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
-.status-bar { margin-bottom: 4px !important; }
 
-/* Make the gallery preview image fill the container properly */
+/* Make the gallery preview image fill the container */
 .gradio-gallery .preview-container,
 .gradio-gallery .preview-container img {
     width: 100% !important;
