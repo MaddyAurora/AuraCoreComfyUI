@@ -1,12 +1,9 @@
 """
 AuraCoreComfyUI - Gradio web frontend for ComfyUI
 
-Connects to an already-running ComfyUI instance via its API.
-Each .json file in the ./workflows/ folder becomes its own tab.
-
-Usage:
-    python app.py
-    (opens at http://localhost:7860)
+Each tab = one AI model.
+Inside each tab, a dropdown selects which workflow JSON to run.
+Workflows live in: ./workflows/<model_folder>/<workflow>.json
 
 ComfyUI must be running separately (default: http://127.0.0.1:8188)
 """
@@ -25,9 +22,9 @@ from typing import Any
 
 import gradio as gr
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
 # Configuration
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
 COMFYUI_HOST = os.environ.get("COMFYUI_HOST", "127.0.0.1")
 COMFYUI_PORT = int(os.environ.get("COMFYUI_PORT", "8188"))
 COMFYUI_URL  = f"http://{COMFYUI_HOST}:{COMFYUI_PORT}"
@@ -41,10 +38,22 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("AuraCoreComfyUI")
 
+# ───────────────────────────────────────────────
+# Model tab definitions
+# Each entry: (Tab label, subfolder name inside workflows/)
+# Subfolder name is used to discover .json files for the dropdown.
+# ───────────────────────────────────────────────
+MODEL_TABS = [
+    ("Krea 2",       "krea2"),
+    ("Qwen Image",   "qwen_image"),
+    ("Ideogram 4",   "ideogram4"),
+    ("Klein 9B",     "klein9b"),
+]
 
-# ─────────────────────────────────────────────
+
+# ───────────────────────────────────────────────
 # ComfyUI API helpers
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
 CLIENT_ID = str(uuid.uuid4())
 
 
@@ -68,28 +77,21 @@ def comfy_api(endpoint: str, data: dict | None = None) -> Any:
 
 
 def check_connection() -> tuple[bool, str]:
-    """Check whether ComfyUI is reachable."""
     result = comfy_api("system_stats")
     if result:
-        return True, f"✅ Connected to ComfyUI at {COMFYUI_URL}"
-    return False, f"❌ Cannot reach ComfyUI at {COMFYUI_URL} — make sure it is running."
+        return True, f"✅ Connected — {COMFYUI_URL}"
+    return False, f"❌ Not connected — {COMFYUI_URL}"
 
 
 def queue_prompt(workflow: dict) -> str | None:
-    """Submit a prompt to ComfyUI and return the prompt_id."""
     payload = {"prompt": workflow, "client_id": CLIENT_ID}
     result = comfy_api("prompt", payload)
     if result and "prompt_id" in result:
         return result["prompt_id"]
-    log.error(f"Failed to queue prompt: {result}")
     return None
 
 
 def wait_for_result(prompt_id: str, timeout: int = 300) -> list[Path]:
-    """
-    Listen via WebSocket until the prompt finishes.
-    Returns list of local image Paths saved to OUTPUTS_DIR.
-    """
     ws = websocket.WebSocket()
     try:
         ws.connect(f"{WS_URL}?clientId={CLIENT_ID}")
@@ -105,41 +107,60 @@ def wait_for_result(prompt_id: str, timeout: int = 300) -> list[Path]:
                 msg = json.loads(raw) if isinstance(raw, str) else {}
             except Exception:
                 break
-
             mtype = msg.get("type", "")
             data  = msg.get("data", {})
-
             if mtype == "executing" and data.get("node") is None and data.get("prompt_id") == prompt_id:
-                break  # generation complete
+                break
     finally:
         ws.close()
 
-    # Fetch output images via history endpoint
     history = comfy_api(f"history/{prompt_id}")
     if not history or prompt_id not in history:
         return []
 
-    outputs = history[prompt_id].get("outputs", {})
     saved = []
-    for node_id, node_out in outputs.items():
+    for node_id, node_out in history[prompt_id].get("outputs", {}).items():
         for img in node_out.get("images", []):
             fname     = img["filename"]
             subfolder = img.get("subfolder", "")
             folder    = img.get("type", "output")
             params    = urllib.parse.urlencode({"filename": fname, "subfolder": subfolder, "type": folder})
-            img_url   = f"{COMFYUI_URL}/view?{params}"
             dest      = OUTPUTS_DIR / fname
             try:
-                urllib.request.urlretrieve(img_url, dest)
+                urllib.request.urlretrieve(f"{COMFYUI_URL}/view?{params}", dest)
                 saved.append(dest)
             except Exception as e:
                 log.error(f"Failed to save image {fname}: {e}")
     return saved
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
 # Workflow helpers
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
+
+def get_workflows_for_model(subfolder: str) -> list[Path]:
+    """Return all .json files inside workflows/<subfolder>/."""
+    folder = WORKFLOWS_DIR / subfolder
+    folder.mkdir(parents=True, exist_ok=True)
+    return sorted(folder.glob("*.json"))
+
+
+def workflow_choices(subfolder: str) -> list[str]:
+    """Return display names (stems) for the workflow dropdown."""
+    files = get_workflows_for_model(subfolder)
+    if not files:
+        return ["(no workflows yet)"]
+    return [f.stem.replace("_", " ").replace("-", " ").title() for f in files]
+
+
+def workflow_path_from_choice(subfolder: str, choice: str) -> Path | None:
+    """Resolve a display name back to its Path."""
+    files = get_workflows_for_model(subfolder)
+    for f in files:
+        if f.stem.replace("_", " ").replace("-", " ").title() == choice:
+            return f
+    return None
+
 
 def load_workflow(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -156,29 +177,21 @@ def inject_text2img_params(
     height: int,
     seed: int,
 ) -> dict:
-    """
-    Inject user parameters into the workflow dict.
-    Finds nodes by class_type (heuristic approach).
-    For complex workflows, target specific node IDs directly.
-    """
-    wf = json.loads(json.dumps(workflow))  # deep copy
+    wf = json.loads(json.dumps(workflow))
 
     for node_id, node in wf.items():
         ctype = node.get("class_type", "")
-
         if ctype in ("KSampler", "KSamplerAdvanced"):
             inp = node.get("inputs", {})
             inp["steps"]   = steps
             inp["cfg"]     = cfg
             inp["seed"]    = seed if seed != -1 else random.randint(0, 2**31)
             inp["denoise"] = inp.get("denoise", 1.0)
-
         if ctype in ("EmptyLatentImage", "EmptySD3LatentImage"):
             inp = node.get("inputs", {})
             inp["width"]  = width
             inp["height"] = height
 
-    # First CLIPTextEncode = positive, second = negative
     clip_nodes = [(nid, n) for nid, n in wf.items()
                   if n.get("class_type") == "CLIPTextEncode"]
     if len(clip_nodes) >= 1:
@@ -189,29 +202,35 @@ def inject_text2img_params(
     return wf
 
 
-def discover_workflow_files() -> list[Path]:
-    """Return all .json files in the workflows/ directory, sorted."""
-    WORKFLOWS_DIR.mkdir(exist_ok=True)
-    return sorted(WORKFLOWS_DIR.glob("*.json"))
+# ───────────────────────────────────────────────
+# Tab builder
+# ───────────────────────────────────────────────
 
+def build_model_tab(label: str, subfolder: str):
+    """
+    Build a tab for one AI model.
+    Workflows are selected from a dropdown populated by
+    .json files found in workflows/<subfolder>/.
+    """
+    choices = workflow_choices(subfolder)
 
-# ─────────────────────────────────────────────
-# Tab builders
-# ─────────────────────────────────────────────
-
-def build_txt2img_tab(workflow_path: Path):
-    """Generic text-to-image tab for a given workflow JSON."""
-    wf_name = workflow_path.stem.replace("_", " ").replace("-", " ").title()
-
-    with gr.TabItem(wf_name):
-        gr.Markdown(f"### {wf_name}\nWorkflow file: `{workflow_path.name}`")
+    with gr.TabItem(label):
+        with gr.Row():
+            workflow_dd = gr.Dropdown(
+                choices=choices,
+                value=choices[0],
+                label="Workflow",
+                scale=3,
+                interactive=True,
+            )
+            reload_btn = gr.Button("🔄 Refresh", scale=1, size="sm")
 
         with gr.Row():
             with gr.Column(scale=2):
                 pos_prompt = gr.Textbox(
                     label="Positive Prompt",
-                    placeholder="a cinematic photo of...",
-                    lines=3,
+                    placeholder="Describe what you want to generate...",
+                    lines=4,
                 )
                 neg_prompt = gr.Textbox(
                     label="Negative Prompt",
@@ -219,15 +238,15 @@ def build_txt2img_tab(workflow_path: Path):
                     lines=2,
                 )
                 with gr.Row():
-                    steps = gr.Slider(1, 60, value=20, step=1, label="Steps")
+                    steps = gr.Slider(1, 60,   value=20,  step=1,   label="Steps")
                     cfg   = gr.Slider(1.0, 20.0, value=7.0, step=0.5, label="CFG")
                 with gr.Row():
                     width  = gr.Slider(256, 2048, value=1024, step=64, label="Width")
                     height = gr.Slider(256, 2048, value=1024, step=64, label="Height")
                 with gr.Row():
-                    seed          = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
+                    seed          = gr.Number(value=-1, label="Seed  (−1 = random)", precision=0)
                     rand_seed_btn = gr.Button("🎲 Randomize", size="sm")
-                generate_btn = gr.Button("🎨 Generate", variant="primary")
+                generate_btn = gr.Button("🎨 Generate", variant="primary", size="lg")
                 status_box   = gr.Textbox(label="Status", interactive=False, lines=1)
 
             with gr.Column(scale=3):
@@ -235,22 +254,37 @@ def build_txt2img_tab(workflow_path: Path):
                     label="Output",
                     columns=2,
                     preview=True,
-                    height=600,
+                    height=620,
                 )
 
-        def randomize_seed():
-            return random.randint(0, 2**31)
+        # Reload workflow list without restarting
+        def reload_workflows():
+            new_choices = workflow_choices(subfolder)
+            return gr.Dropdown(choices=new_choices, value=new_choices[0])
 
-        rand_seed_btn.click(fn=randomize_seed, outputs=seed)
+        reload_btn.click(fn=reload_workflows, outputs=workflow_dd)
 
-        def run_generation(pos, neg, st, cf, w, h, sd):
+        # Randomize seed
+        rand_seed_btn.click(fn=lambda: random.randint(0, 2**31), outputs=seed)
+
+        # Generate
+        def run_generation(wf_choice, pos, neg, st, cf, w, h, sd):
             ok, msg = check_connection()
             if not ok:
                 yield [], msg
                 return
 
+            if wf_choice == "(no workflows yet)":
+                yield [], f"❌ No workflow selected. Add a JSON to workflows/{subfolder}/"
+                return
+
+            wf_path = workflow_path_from_choice(subfolder, wf_choice)
+            if wf_path is None:
+                yield [], f"❌ Could not find workflow file for: {wf_choice}"
+                return
+
             try:
-                workflow = load_workflow(workflow_path)
+                workflow = load_workflow(wf_path)
             except Exception as e:
                 yield [], f"❌ Could not load workflow: {e}"
                 return
@@ -263,28 +297,27 @@ def build_txt2img_tab(workflow_path: Path):
                 yield [], "❌ Failed to queue prompt — check ComfyUI logs."
                 return
 
-            yield [], f"⏳ Queued (prompt_id={pid[:8]}…). Waiting for result…"
+            yield [], f"⏳ Queued [{wf_choice}]  prompt_id={pid[:8]}…"
 
             images = wait_for_result(pid)
             if images:
-                yield [str(p) for p in images], f"✅ Done! {len(images)} image(s) generated."
+                yield [str(p) for p in images], f"✅ Done!  {len(images)} image(s) — {wf_choice}"
             else:
                 yield [], "⚠️ Generation finished but no images were returned."
 
         generate_btn.click(
             fn=run_generation,
-            inputs=[pos_prompt, neg_prompt, steps, cfg, width, height, seed],
+            inputs=[workflow_dd, pos_prompt, neg_prompt, steps, cfg, width, height, seed],
             outputs=[output_gallery, status_box],
         )
 
 
 def build_settings_tab():
-    """Settings tab for connection config."""
     with gr.TabItem("⚙️ Settings"):
         gr.Markdown("### ComfyUI Connection")
         with gr.Row():
             host_inp = gr.Textbox(value=COMFYUI_HOST, label="ComfyUI Host")
-            port_inp = gr.Number(value=COMFYUI_PORT, label="Port", precision=0)
+            port_inp = gr.Number(value=COMFYUI_PORT,  label="Port", precision=0)
         check_btn   = gr.Button("Test Connection", variant="secondary")
         conn_status = gr.Textbox(label="Status", interactive=False)
 
@@ -299,49 +332,74 @@ def build_settings_tab():
 
         check_btn.click(fn=do_check, inputs=[host_inp, port_inp], outputs=conn_status)
 
-        gr.Markdown("---\n### Paths")
-        gr.Textbox(value=str(WORKFLOWS_DIR), label="Workflows folder", interactive=False)
-        gr.Textbox(value=str(OUTPUTS_DIR),   label="Outputs folder",   interactive=False)
+        gr.Markdown("---\n### Workflow folders")
+        for label, subfolder in MODEL_TABS:
+            gr.Textbox(
+                value=str(WORKFLOWS_DIR / subfolder),
+                label=f"{label} workflows",
+                interactive=False,
+            )
         gr.Markdown(
-            "💡 **Tip:** Drop workflow JSONs (exported via ComfyUI → Save API Format) "
-            "into the `workflows/` folder and restart to get a new tab."
+            "---\n"
+            "**How to add a workflow:**\n"
+            "1. In ComfyUI: gear icon → enable Dev Mode → **Save (API Format)**\n"
+            "2. Drop the `.json` into the matching model folder above\n"
+            "3. Click 🔄 Refresh on the tab (no restart needed)"
         )
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
+# CSS
+# ───────────────────────────────────────────────
+APP_CSS = """
+footer { display: none !important; }
+
+/* Tighten the header so tabs appear higher */
+#aura-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px 4px 12px;
+    border-bottom: 1px solid var(--border-color-primary);
+    margin-bottom: 0 !important;
+}
+#aura-title {
+    font-size: 1.3rem;
+    font-weight: 700;
+    margin: 0;
+}
+#aura-status {
+    font-size: 0.85rem;
+    opacity: 0.85;
+    white-space: nowrap;
+}
+
+/* Remove default top margin from Blocks so tabs sit right below header */
+.gradio-container > .main > .wrap {
+    padding-top: 0 !important;
+}
+"""
+
+
+# ───────────────────────────────────────────────
 # Main
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
 
 def create_app() -> gr.Blocks:
-    css = """
-    footer { display: none !important; }
-    .gr-button-primary { font-weight: 600; }
-    """
+    ok, status_msg = check_connection()
 
-    with gr.Blocks(title="AuraCoreComfyUI", theme=gr.themes.Soft(), css=css) as demo:
-        gr.Markdown(
-            "# 🎨 AuraCoreComfyUI\n"
-            "Gradio frontend for your local ComfyUI instance."
-        )
-
-        ok, status_msg = check_connection()
-        gr.Markdown(f"**ComfyUI:** {status_msg}")
-
-        workflows = discover_workflow_files()
-        log.info(f"Found {len(workflows)} workflow(s): {[w.name for w in workflows]}")
+    with gr.Blocks(title="AuraCoreComfyUI") as demo:
+        # Compact header: title on left, connection status on right
+        gr.HTML(f"""
+            <div id="aura-header">
+                <span id="aura-title">🎨 AuraCoreComfyUI</span>
+                <span id="aura-status">{status_msg}</span>
+            </div>
+        """)
 
         with gr.Tabs():
-            if workflows:
-                for wf_path in workflows:
-                    build_txt2img_tab(wf_path)
-            else:
-                with gr.TabItem("📂 No Workflows Found"):
-                    gr.Markdown(
-                        "**No workflow JSON files found.**\n\n"
-                        f"Place your ComfyUI workflow files (saved as API Format) inside:\n\n"
-                        f"`{WORKFLOWS_DIR}`\n\n"
-                        "In ComfyUI: gear icon → enable Dev Mode → **Save (API Format)**."
-                    )
+            for label, subfolder in MODEL_TABS:
+                build_model_tab(label, subfolder)
             build_settings_tab()
 
     return demo
@@ -354,4 +412,6 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         inbrowser=True,
+        theme=gr.themes.Soft(),
+        css=APP_CSS,
     )
