@@ -341,13 +341,12 @@ def build_model_tab(label: str, subfolder: str):
             with gr.Column(scale=3):
                 output_gallery = gr.Gallery(
                     label="Output",
-                    columns=1,          # single column so the image isn't thumbnail-tiny
+                    columns=1,
                     rows=1,
-                    preview=True,       # always show the enlarged preview pane
-                    selected_index=0,   # auto-select first image when loaded
+                    preview=True,
+                    selected_index=0,
                     height=620,
-                    object_fit="contain",  # fill the frame without cropping
-                    show_fullscreen_button=True,
+                    object_fit="contain",
                 )
 
         def on_workflow_change(wf_choice):
@@ -414,7 +413,6 @@ def build_model_tab(label: str, subfolder: str):
             images = wait_for_result(pid)
             if images:
                 paths = [str(p) for p in images]
-                # selected_index=0 forces the gallery straight into preview mode
                 yield gr.Gallery(value=paths, selected_index=0), f"✅ Done!  {len(images)} image(s) — seed {final_seed}"
             else:
                 yield gr.Gallery(value=[], selected_index=None), "⚠️ Done but no images returned."
