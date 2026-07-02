@@ -1,21 +1,14 @@
-# AuraCoreComfyUI
+# AuraCoreGen
 
-A clean Gradio web frontend for your local ComfyUI installation.
-Each workflow JSON = its own tab. No node graph zooming required.
+A Gradio web fronted that connects witha pre-existing ComfyUI instalation.
+Offers web interface for Krea 2, Qwen Image, Ideogram 4 and Klein 9B
 
 ## Quick Start
 
 ```bash
-pip install -r requirements.txt
-python app.py
+# Clone the repository:
+git clone https://github.com/MaddyAurora/AuraCoreGen.git
+# And run start.bat
 # Opens at http://localhost:7860
 ```
 
-## How to Add Workflows
-
-1. In ComfyUI, click gear icon → enable **Dev Mode**
-2. Click **Save (API Format)**
-3. Drop the `.json` into the `workflows/` folder
-4. Restart `app.py` — new tab appears automatically
-
-## Project Structure
