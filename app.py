@@ -56,12 +56,12 @@ MODEL_TABS = [
 
 ASPECT_RATIO_OPTIONS = [
     "1:1 (Square)",
-    "16:9 (Widescreen)",
-    "9:16 (Portrait)",
-    "4:3 (Standard)",
-    "3:4 (Portrait Standard)",
+    "2:3 (Portrait)",
     "3:2 (Photo)",
-    "2:3 (Portrait Photo)",
+    "3:4 (Portrait Standard)",
+    "4:3 (Standard)",
+    "9:16 (Portrait Widescreen)",
+    "16:9 (Widescreen)",
     "21:9 (Ultrawide)",
 ]
 
@@ -255,6 +255,53 @@ def has_negative_prompt(workflow_path: Path) -> bool:
     return True
 
 
+def get_resolution_defaults(workflow_path: Path | None) -> tuple[str, float]:
+    """Read the default aspect ratio / megapixels for a workflow's resolution_node."""
+    if workflow_path:
+        cfg = load_sidecar_config(workflow_path)
+        if cfg and "resolution_node" in cfg:
+            rn = cfg["resolution_node"]
+            return (
+                rn.get("default_aspect_ratio", "1:1 (Square)"),
+                rn.get("default_megapixels", 1.0),
+            )
+    return "1:1 (Square)", 1.0
+
+
+def get_resolution_multiple(workflow_path: Path | None) -> int:
+    if workflow_path:
+        cfg = load_sidecar_config(workflow_path)
+        if cfg and "resolution_node" in cfg:
+            return cfg["resolution_node"].get("multiple", 8)
+    return 8
+
+
+def compute_true_resolution(aspect_ratio: str, megapixels: float, multiple: int = 8) -> tuple[int, int]:
+    """
+    Approximate the width/height that a ComfyUI ResolutionSelector-style node
+    would produce for a given aspect ratio label and megapixel budget.
+
+    NOTE: this mirrors the common "solve for scale that hits the target
+    megapixel count, then round each side to the nearest multiple" approach
+    used by most ComfyUI resolution-selector custom nodes. If the actual
+    ResolutionSelector node in your ComfyUI install rounds differently, the
+    real output may be off by a `multiple` or two from what's shown here.
+    """
+    try:
+        ratio_part = aspect_ratio.split("(")[0].strip()  # "16:9"
+        rw_str, rh_str = ratio_part.split(":")
+        rw, rh = float(rw_str), float(rh_str)
+    except Exception:
+        rw, rh = 1.0, 1.0
+
+    total_pixels = max(megapixels, 0.01) * 1_000_000
+    scale = (total_pixels / (rw * rh)) ** 0.5
+
+    width  = max(multiple, round((rw * scale) / multiple) * multiple)
+    height = max(multiple, round((rh * scale) / multiple) * multiple)
+    return int(width), int(height)
+
+
 # ───────────────────────────────────────────────
 # Injection engine
 # ───────────────────────────────────────────────
@@ -337,6 +384,9 @@ def build_model_tab(label: str, subfolder: str):
     first_path    = workflow_path_from_choice(subfolder, choices[0]) if choices[0] != "(no workflows yet)" else None
     init_ar_mode  = has_aspect_ratio_config(first_path) if first_path else False
     init_show_neg = has_negative_prompt(first_path)     if first_path else True
+    init_ar, init_mp = get_resolution_defaults(first_path)
+    init_multiple    = get_resolution_multiple(first_path)
+    init_w, init_h   = compute_true_resolution(init_ar, init_mp, init_multiple)
 
     with gr.TabItem(label):
 
@@ -370,20 +420,32 @@ def build_model_tab(label: str, subfolder: str):
                     lines=2,
                     visible=init_show_neg,
                 )
+                # Hidden width/height sliders kept only so run_generation's
+                # signature stays workflow-agnostic; not shown for aspect-ratio
+                # workflows like Krea 2.
                 with gr.Row(visible=not init_ar_mode) as pixel_row:
                     width  = gr.Slider(256, 2048, value=1024, step=64, label="Width")
                     height = gr.Slider(256, 2048, value=1024, step=64, label="Height")
                 with gr.Row(visible=init_ar_mode) as ar_row:
+                    megapixels_sl = gr.Number(
+                        value=init_mp,
+                        minimum=0.1,
+                        maximum=8.0,
+                        step=0.05,
+                        label="Megapixels",
+                        scale=2,
+                    )
                     aspect_ratio_dd = gr.Dropdown(
                         choices=ASPECT_RATIO_OPTIONS,
-                        value="1:1 (Square)",
+                        value=init_ar,
                         label="Aspect Ratio",
                         scale=3,
                     )
-                    megapixels_sl = gr.Slider(
-                        0.25, 4.0, value=1.0, step=0.25,
-                        label="Megapixels",
-                        scale=2,
+                with gr.Row(visible=init_ar_mode) as res_info_row:
+                    resolution_info = gr.Textbox(
+                        value=f"Output resolution: {init_w} × {init_h} px",
+                        label="True Resolution",
+                        interactive=False,
                     )
                 with gr.Row():
                     steps = gr.Slider(1, 60,    value=8,   step=1,   label="Steps")
@@ -413,16 +475,43 @@ def build_model_tab(label: str, subfolder: str):
             wf_path  = workflow_path_from_choice(subfolder, wf_choice)
             ar_mode  = has_aspect_ratio_config(wf_path) if wf_path else False
             show_neg = has_negative_prompt(wf_path)     if wf_path else True
+            ar, mp   = get_resolution_defaults(wf_path)
+            mult     = get_resolution_multiple(wf_path)
+            w, h     = compute_true_resolution(ar, mp, mult)
             return (
                 gr.Row(visible=not ar_mode),
                 gr.Row(visible=ar_mode),
+                gr.Row(visible=ar_mode),
                 gr.Textbox(visible=show_neg),
+                gr.Dropdown(value=ar),
+                gr.Number(value=mp),
+                gr.Textbox(value=f"Output resolution: {w} × {h} px"),
             )
 
         workflow_dd.change(
             fn=on_workflow_change,
             inputs=workflow_dd,
-            outputs=[pixel_row, ar_row, neg_prompt],
+            outputs=[
+                pixel_row, ar_row, res_info_row, neg_prompt,
+                aspect_ratio_dd, megapixels_sl, resolution_info,
+            ],
+        )
+
+        def on_resolution_inputs_change(ar, mp, wf_choice):
+            wf_path = workflow_path_from_choice(subfolder, wf_choice)
+            mult    = get_resolution_multiple(wf_path)
+            w, h    = compute_true_resolution(ar, mp or 0, mult)
+            return f"Output resolution: {w} × {h} px"
+
+        aspect_ratio_dd.change(
+            fn=on_resolution_inputs_change,
+            inputs=[aspect_ratio_dd, megapixels_sl, workflow_dd],
+            outputs=resolution_info,
+        )
+        megapixels_sl.change(
+            fn=on_resolution_inputs_change,
+            inputs=[aspect_ratio_dd, megapixels_sl, workflow_dd],
+            outputs=resolution_info,
         )
 
         reload_btn.click(
@@ -539,7 +628,9 @@ def build_settings_tab():
             "3. If needed, create a `<workflow_name>_config.json` sidecar next to it\n"
             "4. Click 🔄 Refresh on the tab (no restart needed)\n\n"
             "**Sidecar config keys:** `prompt_node`, `negative_prompt` (false to hide), "
-            "`seed_node`, `steps_node`, `cfg_node`, `resolution_node`"
+            "`seed_node`, `steps_node`, `cfg_node`, `resolution_node` "
+            "(`default_aspect_ratio`, `default_megapixels`, `multiple` for the rounding "
+            "step used by the True Resolution readout)"
         )
 
 

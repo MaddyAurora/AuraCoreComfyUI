@@ -1,5 +1,5 @@
 {
-  "_comment": "Sidecar config for Krea-2-Direct-Prompting-API.json\nThis file tells app.py exactly which node IDs to inject UI values into.\nThe workflow JSON must sit in the same folder with the same base name.",
+  "_comment": "Sidecar config for krea2.json\nThis file tells app.py exactly which node IDs to inject UI values into.\nThe workflow JSON must sit in the same folder with the same base name.",
 
   "prompt_node":     { "id": "37", "field": "value" },
   "negative_prompt": false,
@@ -14,6 +14,7 @@
     "aspect_ratio_field": "aspect_ratio",
     "megapixels_field": "megapixels",
     "default_aspect_ratio": "1:1 (Square)",
-    "default_megapixels": 1.0
+    "default_megapixels": 1.5,
+    "multiple": 8
   }
 }
